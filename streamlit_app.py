@@ -378,11 +378,10 @@ def fetch_sportsbook_events(api_key, selected_sports_tuple, selected_markets_tup
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_poly_teams():
-    """Official Gamma team metadata: name, league, abbreviation, alias."""
+    """Official Gamma team metadata, cached for an hour."""
     rows = []
-    with httpx.Client(timeout=20) as client:
-        offset = 0
-        for _ in range(10):
+    with httpx.Client(timeout=15) as client:
+        for offset in (0, 500):
             r = client.get(f"{GAMMA}/teams", params={"limit": 500, "offset": offset})
             r.raise_for_status()
             data = r.json()
@@ -391,69 +390,66 @@ def fetch_poly_teams():
             rows.extend(data)
             if len(data) < 500:
                 break
-            offset += len(data)
     return rows
 
 
-def team_variants(team_name: str, sport_label: str, poly_teams):
-    """Build aliases from sportsbook names plus Polymarket's official teams table."""
-    full = norm(team_name)
-    words = full.split()
-    variants = {full}
-    if words:
-        variants.add(words[-1])
-    if len(words) >= 2:
-        variants.add(" ".join(words[-2:]))
-    if len(words) >= 3:
-        variants.add(" ".join(words[-3:]))
-
-    league_aliases = {
-        "NFL": {"nfl"},
-        "NBA": {"nba"},
-        "MLB": {"mlb"},
-        "NHL": {"nhl"},
-    }.get(sport_label, set())
-
-    nickname = words[-1] if words else ""
-    last_two = " ".join(words[-2:]) if len(words) >= 2 else nickname
-
+def build_team_alias_index(poly_teams):
+    leagues = {}
     for t in poly_teams or []:
         league = norm(t.get("league"))
-        if league_aliases and league not in league_aliases:
-            continue
-        vals = [
+        vals = {
             norm(t.get("name")),
             norm(t.get("alias")),
             norm(t.get("abbreviation")),
-        ]
-        vals = [x for x in vals if x]
-        if not vals:
-            continue
-        joined = " ".join(vals)
-        name_score = max(
-            SequenceMatcher(None, full, x).ratio() * 100 for x in vals
-        )
-        nickname_hit = bool(nickname and re.search(rf"\b{re.escape(nickname)}\b", joined))
-        last_two_hit = bool(last_two and last_two in joined)
-        if name_score >= 58 or nickname_hit or last_two_hit:
-            variants.update(vals)
-
-    return {x for x in variants if len(x) >= 2}
+        }
+        vals = {x for x in vals if x}
+        if vals:
+            leagues.setdefault(league, []).append(vals)
+    return leagues
 
 
-def text_team_score(text: str, team_name: str, sport_label: str, poly_teams) -> float:
+def team_variants_fast(team_name: str, sport_label: str, alias_index):
+    full = norm(team_name)
+    words = full.split()
+    basic = {full}
+    if words:
+        basic.add(words[-1])
+    if len(words) >= 2:
+        basic.add(" ".join(words[-2:]))
+
+    league = {
+        "NFL": "nfl",
+        "NBA": "nba",
+        "MLB": "mlb",
+        "NHL": "nhl",
+    }.get(sport_label)
+
+    candidates = alias_index.get(league, []) if league else []
+    best_vals = None
+    best = 0.0
+    for vals in candidates:
+        for v in vals:
+            score = 100.0 * SequenceMatcher(None, full, v).ratio()
+            if words and words[-1] and words[-1] in v.split():
+                score += 18
+            if score > best:
+                best = score
+                best_vals = vals
+    if best_vals and best >= 55:
+        basic.update(best_vals)
+    return {x for x in basic if len(x) >= 2}
+
+
+def text_team_score_fast(text: str, team_name: str, sport_label: str, alias_index) -> float:
     nt = norm(text)
     if not nt:
         return 0.0
     best = 0.0
-    for v in team_variants(team_name, sport_label, poly_teams):
-        if not v:
-            continue
-        # Exact alias/abbreviation occurrence is strong evidence.
+    for v in team_variants_fast(team_name, sport_label, alias_index):
         if len(v) >= 3 and re.search(rf"\b{re.escape(v)}\b", nt):
-            best = max(best, 96.0 if " " in v else 91.0)
+            best = max(best, 98.0 if " " in v else 92.0)
+        # token overlap is enough for fallback; avoid multiple SequenceMatchers.
         best = max(best, token_set_ratio(nt, v))
-        best = max(best, ratio(nt, v))
     return best
 
 
@@ -472,13 +468,13 @@ def poly_match_text(poly):
     )
 
 
-def event_score(poly, book_event, poly_teams):
+def event_score(poly, book_event, alias_index):
     text = poly_match_text(poly)
     sport = book_event.get("_sport_label")
     home = str(book_event.get("home_team") or "")
     away = str(book_event.get("away_team") or "")
-    hs = text_team_score(text, home, sport, poly_teams)
-    aws = text_team_score(text, away, sport, poly_teams)
+    hs = text_team_score_fast(text, home, sport, alias_index)
+    aws = text_team_score_fast(text, away, sport, alias_index)
 
     # A same-game market should identify both sides. Weight the weaker side most.
     base = 0.72 * min(hs, aws) + 0.28 * max(hs, aws)
@@ -516,7 +512,7 @@ def line_compatible(poly, book_market, outcome):
     return any(abs(abs(x) - abs(point)) <= 0.26 for x in nums) if nums else True
 
 
-def selection_score(poly, book_event, book_market, outcome, poly_teams):
+def selection_score(poly, book_event, book_market, outcome, alias_index):
     question = " ".join(
         str(x or "")
         for x in [
@@ -530,12 +526,12 @@ def selection_score(poly, book_event, book_market, outcome, poly_teams):
     sport = book_event.get("_sport_label")
 
     if book_market == "h2h":
-        return text_team_score(question, name, sport, poly_teams)
+        return text_team_score_fast(question, name, sport, alias_index)
 
     if book_market == "spreads":
         if not line_compatible(poly, book_market, outcome):
             return 0.0
-        return text_team_score(question, name, sport, poly_teams)
+        return text_team_score_fast(question, name, sport, alias_index)
 
     if book_market == "totals":
         if not line_compatible(poly, book_market, outcome):
@@ -552,7 +548,7 @@ def selection_score(poly, book_event, book_market, outcome, poly_teams):
     return 0.0
 
 
-def candidate_debug(poly_markets, book_events, selected_markets, poly_teams, limit=12):
+def candidate_debug(poly_markets, book_events, selected_markets, alias_index, limit=12):
     """Show best raw candidates even when thresholds reject them."""
     wanted = {MARKET_TO_API[x] for x in selected_markets}
     by_sport_type = {}
@@ -574,8 +570,8 @@ def candidate_debug(poly_markets, book_events, selected_markets, poly_teams, lim
                         continue
                     candidates = []
                     for p in by_sport_type.get((sport, mkt), []):
-                        es = event_score(p, ev, poly_teams)
-                        ss = selection_score(p, ev, mkt, out, poly_teams)
+                        es = event_score(p, ev, alias_index)
+                        ss = selection_score(p, ev, mkt, out, alias_index)
                         time_diff = None
                         if p.get("event_start") and parse_ts(ev.get("commence_time")):
                             time_diff = abs(p["event_start"] - parse_ts(ev.get("commence_time"))) / 3600
@@ -602,7 +598,7 @@ def candidate_debug(poly_markets, book_events, selected_markets, poly_teams, lim
     return rows
 
 
-def match_metadata(poly_markets, book_events, selected_markets, poly_teams):
+def match_metadata(poly_markets, book_events, selected_markets, alias_index):
     wanted = {MARKET_TO_API[x] for x in selected_markets}
     by_sport_type = {}
     for p in poly_markets:
@@ -635,8 +631,8 @@ def match_metadata(poly_markets, book_events, selected_markets, poly_teams):
                     best = None
 
                     for p in by_sport_type.get((sport, mkt), []):
-                        es = event_score(p, ev, poly_teams)
-                        ss = selection_score(p, ev, mkt, out, poly_teams)
+                        es = event_score(p, ev, alias_index)
+                        ss = selection_score(p, ev, mkt, out, alias_index)
 
                         # Name/alias evidence is primary. Time is a bonus, not a
                         # hard rejection, because Gamma sports timestamps can
@@ -682,6 +678,15 @@ def match_metadata(poly_markets, book_events, selected_markets, poly_teams):
                         "poly_volume": p.get("volume"),
                     })
     return matched, attempts
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_match_metadata(poly_markets_json, book_events_json, selected_markets_tuple, poly_teams_json):
+    poly_markets = json.loads(poly_markets_json)
+    book_events = json.loads(book_events_json)
+    poly_teams = json.loads(poly_teams_json)
+    alias_index = build_team_alias_index(poly_teams)
+    return match_metadata(poly_markets, book_events, list(selected_markets_tuple), alias_index)
 
 def fetch_clob_books(token_ids):
     token_ids = list(dict.fromkeys([str(x) for x in token_ids if x]))
@@ -749,7 +754,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("DREW EDGE BOARD")
-st.caption("Polymarket YES × DraftKings × FanDuel • Edge • EV • Kelly • alias-aware matcher V5")
+st.caption("Polymarket YES × DraftKings × FanDuel • Edge • EV • Kelly • fast cached matcher V6")
 
 secret_key = str(get_secret("ODDS_API_KEY", "")).strip()
 with st.sidebar:
@@ -782,7 +787,7 @@ with st.sidebar:
     max_book_age = st.slider("Max sportsbook quote age (sec)", 30, 240, 95, 5)
     max_poly_age = st.slider("Max Poly quote age (sec)", 5, 120, 30, 5)
     if api_key:
-        st.caption("Sportsbook data cached for 60s to protect API credits.")
+        st.caption("Sportsbook data cached for 60s. Event matching cached for 5 min; live Poly prices refresh every 15s.")
     else:
         st.warning("Add your Odds API key to load DK/FD.")
 
@@ -793,7 +798,7 @@ if not selected_markets:
     st.info("Choose at least one market in the sidebar.")
     st.stop()
 
-@st.fragment(run_every="5s")
+@st.fragment(run_every="15s")
 def board():
     poly_markets, poly_diag = fetch_poly_yes_markets(tuple(selected_sports))
     book_events, book_errors = fetch_sportsbook_events(api_key, tuple(selected_sports), tuple(selected_markets))
@@ -802,7 +807,16 @@ def board():
     except Exception as team_exc:
         poly_teams = []
         poly_diag.setdefault("errors", []).append(f"Polymarket teams metadata: {team_exc}")
-    meta_matches, attempts = match_metadata(poly_markets, book_events, selected_markets, poly_teams)
+
+    # Expensive event matching is cached for 5 minutes. Live CLOB prices below
+    # still refresh on every fragment run.
+    poly_json = json.dumps(poly_markets, sort_keys=True, default=str)
+    book_json = json.dumps(book_events, sort_keys=True, default=str)
+    teams_json = json.dumps(poly_teams, sort_keys=True, default=str)
+    meta_matches, attempts = cached_match_metadata(
+        poly_json, book_json, tuple(selected_markets), teams_json
+    )
+    alias_index = build_team_alias_index(poly_teams)
     books, clob_errors = fetch_clob_books([x["token_id"] for x in meta_matches])
 
     rows = []
@@ -980,10 +994,20 @@ def board():
                     "books": ", ".join(b.get("key","") for b in e.get("bookmakers", [])),
                 } for e in book_events[:20]]
                 st.dataframe(pd.DataFrame(sample), use_container_width=True, hide_index=True)
-        debug_candidates = candidate_debug(poly_markets, book_events, selected_markets, poly_teams, limit=15)
-        if debug_candidates:
-            with st.expander("Best rejected/accepted match candidates", expanded=(len(meta_matches) == 0)):
-                st.dataframe(pd.DataFrame(debug_candidates), use_container_width=True, hide_index=True)
+        run_deep_debug = st.checkbox(
+            "Run deep match diagnostics (slower)",
+            value=False,
+            help="Only enable this when we are troubleshooting zero matches.",
+            key="deep_debug_v6",
+        )
+        if run_deep_debug:
+            with st.spinner("Analyzing best rejected match candidates..."):
+                debug_candidates = candidate_debug(
+                    poly_markets, book_events, selected_markets, alias_index, limit=15
+                )
+            if debug_candidates:
+                with st.expander("Best rejected/accepted match candidates", expanded=True):
+                    st.dataframe(pd.DataFrame(debug_candidates), use_container_width=True, hide_index=True)
         if meta_matches:
             with st.expander("Sample metadata matches"):
                 st.dataframe(pd.DataFrame(meta_matches[:30])[
