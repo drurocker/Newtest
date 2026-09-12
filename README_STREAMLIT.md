@@ -53,3 +53,11 @@ Streamlit Community Cloud can put an inactive app to sleep. That means this V1 i
 ## V1.1 sportsbook-key fix
 
 If Streamlit Secrets has not been configured, the sidebar now includes a password field for **The Odds API key**. Paste the key there and the DraftKings/FanDuel polling engine starts immediately for that browser session. For a permanent setup, store `ODDS_API_KEY` in Streamlit Community Cloud → Manage app → Settings → Secrets.
+
+## Sept 12 live-board matching fix
+
+This build also fixes two issues discovered during live testing:
+
+- Polymarket WebSocket subscriptions now use the documented `operation: subscribe` update message after the first 500 tokens, so the board can receive quotes beyond the first subscription batch.
+- Sportsbook team selections are matched correctly to Polymarket's common binary `Yes/No` sports propositions by using the market question/title instead of comparing the literal word `Yes` to a team name.
+- The Sports selector is populated directly from loaded sportsbook events, so NFL/NBA/etc. remain selectable while Poly/book matching warms up.

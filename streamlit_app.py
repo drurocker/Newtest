@@ -323,11 +323,20 @@ class EdgeEngine:
                 async with websockets.connect(POLY_WS, ping_interval=None, close_timeout=5, max_size=8_000_000) as ws:
                     with self.lock:
                         self.connections["poly"] = "live"
-                    for i in range(0, len(toks), 500):
+                    # Polymarket expects ONE initial subscription request.  Any
+                    # additional assets must be added with operation=subscribe.
+                    # Sending repeated initial subscription messages caused only
+                    # the first ~500 tokens to receive order-book snapshots.
+                    first = toks[:500]
+                    await ws.send(json.dumps({
+                        "assets_ids": first,
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }))
+                    for i in range(500, len(toks), 500):
                         await ws.send(json.dumps({
+                            "operation": "subscribe",
                             "assets_ids": toks[i:i + 500],
-                            "type": "market",
-                            "custom_feature_enabled": True,
                         }))
 
                     async def heartbeat():
@@ -439,20 +448,58 @@ class EdgeEngine:
                 await asyncio.sleep(POLL_SECONDS)
 
     def find_poly_for_event(self, ev, book_market, book_outcome):
+        """Find the Polymarket token corresponding to a sportsbook outcome.
+
+        Most Polymarket sports propositions are binary YES/NO markets (for
+        example, "Will Buffalo win?").  The old matcher compared the literal
+        word "Yes" to the sportsbook team name, which rejected nearly every
+        valid sports match.  For a YES token we instead compare the sportsbook
+        outcome to the market question/title.  We intentionally avoid NO tokens
+        for these binary proposition markets because a NO outcome is not always
+        identical to the opposing sportsbook selection (draws and settlement
+        rules can matter).
+        """
         target_type = {"h2h": "moneyline", "spreads": "spreads", "totals": "totals"}.get(book_market)
         if not target_type:
             return None
+
         best = None
+        home = norm_text(ev.get("home_team", ""))
+        away = norm_text(ev.get("away_team", ""))
+        book_name = norm_text(book_outcome.get("name", ""))
+
         with self.lock:
             items = list(self.poly_markets.items())
+
         for tok, m in items:
             mt = str(m.get("market_type") or "").lower()
             if target_type not in mt:
                 continue
+
+            # Game times are the strongest cross-provider anchor we have.
             if m.get("game_start") and ev.get("_start_ts") and abs(m["game_start"] - ev["_start_ts"]) > 6 * 3600:
                 continue
-            score = match_score(m.get("title", ""), ev.get("home_team", ""), ev.get("away_team", ""))
-            sel_score = token_set_ratio(norm_text(m.get("selection", "")), norm_text(book_outcome.get("name", "")))
+
+            title = norm_text(m.get("title", ""))
+            poly_selection = norm_text(m.get("selection", ""))
+
+            # Gamma commonly represents sports propositions as Yes/No.
+            # Match the explicit YES proposition to the sportsbook selection.
+            if poly_selection in {"yes", "no"}:
+                if poly_selection == "no":
+                    continue
+                selection_score = token_set_ratio(title, book_name)
+            else:
+                selection_score = token_set_ratio(poly_selection, book_name)
+
+            # Event confidence: some Poly questions mention both teams, while
+            # others only mention the selected team.  Use the strongest form.
+            event_score = max(
+                token_set_ratio(title, home),
+                token_set_ratio(title, away),
+                token_set_ratio(title, f"{away} {home}".strip()),
+            )
+
             point = book_outcome.get("point")
             if book_market in ("spreads", "totals") and point is not None and m.get("line") is not None:
                 try:
@@ -460,8 +507,14 @@ class EdgeEngine:
                         continue
                 except Exception:
                     pass
-            combined = 0.75 * score + 0.25 * sel_score
-            if combined >= 70 and (best is None or combined > best[0]):
+
+            # Require the actual sportsbook selection to be identifiable in the
+            # Poly proposition.  This avoids pairing two unrelated games that
+            # happen to start at the same time.
+            if selection_score < 62:
+                continue
+            combined = 0.68 * selection_score + 0.32 * event_score
+            if combined >= 66 and (best is None or combined > best[0]):
                 best = (combined, tok, m)
         return best
 
@@ -538,6 +591,11 @@ class EdgeEngine:
                 "poly_market_count": len(self.poly_markets),
                 "poly_quote_count": len(self.poly_quotes),
                 "sportsbook_event_count": len(self.sportsbook_events),
+                "available_sports": sorted({
+                    SPORT_LABELS.get(ev.get("_sport"), ev.get("_sport"))
+                    for ev in self.sportsbook_events.values() if ev.get("_sport")
+                }),
+                "matched_row_count": len(self.base_rows),
                 "errors": list(self.errors),
                 "signal_history": list(self.signal_history),
                 "uptime": now_ts() - self.started_at,
@@ -691,7 +749,8 @@ def live_board():
         f'Sportsbooks: <b>{"🟢 LIVE" if book_live else "🟡 " + str(conn.get("sportsbook"))}</b> &nbsp;•&nbsp; '
         f'Poly markets: <b>{snap["poly_market_count"]}</b> &nbsp;•&nbsp; '
         f'Poly quotes: <b>{snap["poly_quote_count"]}</b> &nbsp;•&nbsp; '
-        f'Book events: <b>{snap["sportsbook_event_count"]}</b>'
+        f'Book events: <b>{snap["sportsbook_event_count"]}</b> &nbsp;•&nbsp; '
+        f'Matched prices: <b>{snap.get("matched_row_count", 0)}</b>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -708,7 +767,10 @@ def live_board():
     # Filters
     with st.container(border=True):
         c1, c2, c3, c4, c5 = st.columns([1.2, 1.3, 1.1, 1.2, 1.2])
-        sport_options = sorted({r["sport_label"] for r in calculated})
+        # Populate the Sports selector from the sportsbook feed itself, not
+        # only from successfully matched Poly rows.  That way NFL/NBA/etc. are
+        # selectable immediately even while matching is warming up.
+        sport_options = snap.get("available_sports") or sorted({r["sport_label"] for r in calculated})
         selected_sports = c1.multiselect("Sports", sport_options, default=sport_options)
         market_options = ["Moneyline", "Spread", "Total"]
         selected_markets = c2.multiselect("Markets", market_options, default=market_options)
@@ -852,6 +914,8 @@ def live_board():
             "Polymarket markets": snap.get("poly_market_count"),
             "Polymarket quotes": snap.get("poly_quote_count"),
             "Sportsbook events": snap.get("sportsbook_event_count"),
+            "Matched Poly/book prices": snap.get("matched_row_count", 0),
+            "Available sports": ", ".join(snap.get("available_sports", [])),
             "Feed uptime minutes": round(snap.get("uptime", 0) / 60, 1),
         })
         errs = snap.get("errors", [])
