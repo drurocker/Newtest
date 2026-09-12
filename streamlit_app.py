@@ -285,6 +285,8 @@ def fetch_poly_yes_markets(selected_sports_tuple):
                                         "sport_label": label,
                                         "event_id": ev_id,
                                         "event_title": ev_title,
+                                        "event_slug": str(ev.get("slug") or ""),
+                                        "ticker": str(ev.get("ticker") or ""),
                                         "event_start": parse_ts(
                                             m.get("gameStartTime")
                                             or m.get("eventStartTime")
@@ -292,6 +294,7 @@ def fetch_poly_yes_markets(selected_sports_tuple):
                                         "market_type": mk_type,
                                         "question": question,
                                         "group_title": str(m.get("groupItemTitle") or ""),
+                                        "market_slug": str(m.get("slug") or ""),
                                         "line": line,
                                         "token_id": str(tokens[yes_idx]),
                                         "market_id": str(m.get("id") or ""),
@@ -372,16 +375,125 @@ def fetch_sportsbook_events(api_key, selected_sports_tuple, selected_markets_tup
     return list(merged.values()), errors
 
 
-def event_score(poly, book_event):
-    ptitle = poly["event_title"]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_poly_teams():
+    """Official Gamma team metadata: name, league, abbreviation, alias."""
+    rows = []
+    with httpx.Client(timeout=20) as client:
+        offset = 0
+        for _ in range(10):
+            r = client.get(f"{GAMMA}/teams", params={"limit": 500, "offset": offset})
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                break
+            rows.extend(data)
+            if len(data) < 500:
+                break
+            offset += len(data)
+    return rows
+
+
+def team_variants(team_name: str, sport_label: str, poly_teams):
+    """Build aliases from sportsbook names plus Polymarket's official teams table."""
+    full = norm(team_name)
+    words = full.split()
+    variants = {full}
+    if words:
+        variants.add(words[-1])
+    if len(words) >= 2:
+        variants.add(" ".join(words[-2:]))
+    if len(words) >= 3:
+        variants.add(" ".join(words[-3:]))
+
+    league_aliases = {
+        "NFL": {"nfl"},
+        "NBA": {"nba"},
+        "MLB": {"mlb"},
+        "NHL": {"nhl"},
+    }.get(sport_label, set())
+
+    nickname = words[-1] if words else ""
+    last_two = " ".join(words[-2:]) if len(words) >= 2 else nickname
+
+    for t in poly_teams or []:
+        league = norm(t.get("league"))
+        if league_aliases and league not in league_aliases:
+            continue
+        vals = [
+            norm(t.get("name")),
+            norm(t.get("alias")),
+            norm(t.get("abbreviation")),
+        ]
+        vals = [x for x in vals if x]
+        if not vals:
+            continue
+        joined = " ".join(vals)
+        name_score = max(
+            SequenceMatcher(None, full, x).ratio() * 100 for x in vals
+        )
+        nickname_hit = bool(nickname and re.search(rf"\b{re.escape(nickname)}\b", joined))
+        last_two_hit = bool(last_two and last_two in joined)
+        if name_score >= 58 or nickname_hit or last_two_hit:
+            variants.update(vals)
+
+    return {x for x in variants if len(x) >= 2}
+
+
+def text_team_score(text: str, team_name: str, sport_label: str, poly_teams) -> float:
+    nt = norm(text)
+    if not nt:
+        return 0.0
+    best = 0.0
+    for v in team_variants(team_name, sport_label, poly_teams):
+        if not v:
+            continue
+        # Exact alias/abbreviation occurrence is strong evidence.
+        if len(v) >= 3 and re.search(rf"\b{re.escape(v)}\b", nt):
+            best = max(best, 96.0 if " " in v else 91.0)
+        best = max(best, token_set_ratio(nt, v))
+        best = max(best, ratio(nt, v))
+    return best
+
+
+def poly_match_text(poly):
+    return " ".join(
+        str(x or "")
+        for x in [
+            poly.get("event_title"),
+            poly.get("question"),
+            poly.get("group_title"),
+            poly.get("event_slug"),
+            poly.get("market_slug"),
+            poly.get("ticker"),
+        ]
+        if x
+    )
+
+
+def event_score(poly, book_event, poly_teams):
+    text = poly_match_text(poly)
+    sport = book_event.get("_sport_label")
     home = str(book_event.get("home_team") or "")
     away = str(book_event.get("away_team") or "")
-    hs = token_set_ratio(ptitle, home)
-    aws = token_set_ratio(ptitle, away)
-    both = token_set_ratio(ptitle, f"{away} {home}")
-    # Require evidence for both teams where possible; reward the combined phrase.
-    return 0.35 * hs + 0.35 * aws + 0.30 * both
+    hs = text_team_score(text, home, sport, poly_teams)
+    aws = text_team_score(text, away, sport, poly_teams)
 
+    # A same-game market should identify both sides. Weight the weaker side most.
+    base = 0.72 * min(hs, aws) + 0.28 * max(hs, aws)
+
+    pstart = poly.get("event_start")
+    bstart = parse_ts(book_event.get("commence_time"))
+    if pstart and bstart:
+        hours = abs(pstart - bstart) / 3600
+        if hours <= 6:
+            base += 10
+        elif hours <= 24:
+            base += 5
+        elif hours > 96:
+            base -= 8
+    return max(0.0, min(100.0, base))
 
 def numbers_in_text(s):
     return [float(x) for x in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)", str(s or ""))]
@@ -404,31 +516,93 @@ def line_compatible(poly, book_market, outcome):
     return any(abs(abs(x) - abs(point)) <= 0.26 for x in nums) if nums else True
 
 
-def selection_score(poly, book_market, outcome):
-    question = f"{poly.get('question','')} {poly.get('group_title','')}"
+def selection_score(poly, book_event, book_market, outcome, poly_teams):
+    question = " ".join(
+        str(x or "")
+        for x in [
+            poly.get("question"),
+            poly.get("group_title"),
+            poly.get("market_slug"),
+        ]
+        if x
+    )
     name = str(outcome.get("name") or "")
+    sport = book_event.get("_sport_label")
+
     if book_market == "h2h":
-        return token_set_ratio(question, name)
+        return text_team_score(question, name, sport, poly_teams)
+
     if book_market == "spreads":
         if not line_compatible(poly, book_market, outcome):
             return 0.0
-        return token_set_ratio(question, name)
+        return text_team_score(question, name, sport, poly_teams)
+
     if book_market == "totals":
         if not line_compatible(poly, book_market, outcome):
             return 0.0
         side = norm(name)
         q = norm(question)
         if side == "over":
-            return 100.0 if "over" in q else 0.0
+            return 100.0 if re.search(r"\bover\b", q) else 0.0
         if side == "under":
-            # YES-only means a Poly question phrased as "over" cannot be used
-            # as the sportsbook Under price by simply taking the NO token.
-            return 100.0 if "under" in q else 0.0
+            # YES-only: never infer Under from the NO side of an Over market.
+            return 100.0 if re.search(r"\bunder\b", q) else 0.0
         return token_set_ratio(question, name)
+
     return 0.0
 
 
-def match_metadata(poly_markets, book_events, selected_markets):
+def candidate_debug(poly_markets, book_events, selected_markets, poly_teams, limit=12):
+    """Show best raw candidates even when thresholds reject them."""
+    wanted = {MARKET_TO_API[x] for x in selected_markets}
+    by_sport_type = {}
+    for p in poly_markets:
+        by_sport_type.setdefault((p["sport_label"], p["market_type"]), []).append(p)
+
+    rows = []
+    for ev in book_events:
+        sport = ev.get("_sport_label")
+        for bk in ev.get("bookmakers", []):
+            if bk.get("key") not in BOOKMAKERS:
+                continue
+            for mk in bk.get("markets", []):
+                mkt = mk.get("key")
+                if mkt not in wanted:
+                    continue
+                for out in mk.get("outcomes") or []:
+                    if out.get("price") is None:
+                        continue
+                    candidates = []
+                    for p in by_sport_type.get((sport, mkt), []):
+                        es = event_score(p, ev, poly_teams)
+                        ss = selection_score(p, ev, mkt, out, poly_teams)
+                        time_diff = None
+                        if p.get("event_start") and parse_ts(ev.get("commence_time")):
+                            time_diff = abs(p["event_start"] - parse_ts(ev.get("commence_time"))) / 3600
+                        total = 0.60 * es + 0.40 * ss
+                        candidates.append((total, es, ss, time_diff, p))
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        total, es, ss, td, p = candidates[0]
+                        rows.append({
+                            "Sport": sport,
+                            "Book game": f"{ev.get('away_team')} @ {ev.get('home_team')}",
+                            "Book selection": out.get("name"),
+                            "Market": mkt,
+                            "Best score": round(total, 1),
+                            "Event score": round(es, 1),
+                            "Selection score": round(ss, 1),
+                            "Time diff h": None if td is None else round(td, 1),
+                            "Poly event": p.get("event_title"),
+                            "Poly question": p.get("question"),
+                            "Poly market type": p.get("market_type"),
+                        })
+                        if len(rows) >= limit:
+                            return rows
+    return rows
+
+
+def match_metadata(poly_markets, book_events, selected_markets, poly_teams):
     wanted = {MARKET_TO_API[x] for x in selected_markets}
     by_sport_type = {}
     for p in poly_markets:
@@ -438,12 +612,14 @@ def match_metadata(poly_markets, book_events, selected_markets):
     attempts = 0
     for ev in book_events:
         sport = ev.get("_sport_label")
-        book_start = parse_ts(ev.get("commence_time"))
+        bstart = parse_ts(ev.get("commence_time"))
+
         for bk in ev.get("bookmakers", []):
             book_key = bk.get("key")
             if book_key not in BOOKMAKERS:
                 continue
             book_age = max(0.0, time.time() - (parse_ts(bk.get("last_update")) or time.time()))
+
             for mk in bk.get("markets", []):
                 mkt = mk.get("key")
                 if mkt not in wanted:
@@ -451,26 +627,40 @@ def match_metadata(poly_markets, book_events, selected_markets):
                 outs = mk.get("outcomes") or []
                 implieds = [implied_prob(float(o["price"])) for o in outs if o.get("price") is not None]
                 denom = sum(implieds)
+
                 for out in outs:
                     if out.get("price") is None:
                         continue
                     attempts += 1
                     best = None
+
                     for p in by_sport_type.get((sport, mkt), []):
+                        es = event_score(p, ev, poly_teams)
+                        ss = selection_score(p, ev, mkt, out, poly_teams)
+
+                        # Name/alias evidence is primary. Time is a bonus, not a
+                        # hard rejection, because Gamma sports timestamps can
+                        # represent different lifecycle moments.
+                        if es < 48 or ss < 52:
+                            continue
+
+                        score = 0.60 * es + 0.40 * ss
+
+                        # Strong same-date evidence gets a small bonus.
                         pstart = p.get("event_start")
-                        if pstart and book_start and abs(pstart - book_start) > 12 * 3600:
-                            continue
-                        es = event_score(p, ev)
-                        if es < 52:
-                            continue
-                        ss = selection_score(p, mkt, out)
-                        if ss < 58:
-                            continue
-                        score = 0.58 * es + 0.42 * ss
-                        if best is None or score > best[0]:
+                        if pstart and bstart:
+                            hours = abs(pstart - bstart) / 3600
+                            if hours <= 6:
+                                score += 6
+                            elif hours <= 24:
+                                score += 3
+
+                        if score >= 55 and (best is None or score > best[0]):
                             best = (score, p)
+
                     if not best:
                         continue
+
                     score, p = best
                     matched.append({
                         "sport": sport,
@@ -483,7 +673,7 @@ def match_metadata(poly_markets, book_events, selected_markets):
                         "odds": int(out["price"]),
                         "no_vig": implied_prob(float(out["price"])) / denom if denom else None,
                         "book_age": book_age,
-                        "match_score": score,
+                        "match_score": min(score, 100.0),
                         "token_id": p["token_id"],
                         "poly_question": p["question"],
                         "poly_event": p["event_title"],
@@ -492,7 +682,6 @@ def match_metadata(poly_markets, book_events, selected_markets):
                         "poly_volume": p.get("volume"),
                     })
     return matched, attempts
-
 
 def fetch_clob_books(token_ids):
     token_ids = list(dict.fromkeys([str(x) for x in token_ids if x]))
@@ -560,7 +749,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("DREW EDGE BOARD")
-st.caption("Polymarket YES × DraftKings × FanDuel • Edge • EV • Kelly")
+st.caption("Polymarket YES × DraftKings × FanDuel • Edge • EV • Kelly • alias-aware matcher V5")
 
 secret_key = str(get_secret("ODDS_API_KEY", "")).strip()
 with st.sidebar:
@@ -608,7 +797,12 @@ if not selected_markets:
 def board():
     poly_markets, poly_diag = fetch_poly_yes_markets(tuple(selected_sports))
     book_events, book_errors = fetch_sportsbook_events(api_key, tuple(selected_sports), tuple(selected_markets))
-    meta_matches, attempts = match_metadata(poly_markets, book_events, selected_markets)
+    try:
+        poly_teams = fetch_poly_teams()
+    except Exception as team_exc:
+        poly_teams = []
+        poly_diag.setdefault("errors", []).append(f"Polymarket teams metadata: {team_exc}")
+    meta_matches, attempts = match_metadata(poly_markets, book_events, selected_markets, poly_teams)
     books, clob_errors = fetch_clob_books([x["token_id"] for x in meta_matches])
 
     rows = []
@@ -764,6 +958,7 @@ def board():
             "Polymarket non-YES markets skipped": poly_diag.get("non_yes_skipped"),
             "Sportsbook events": len(book_events),
             "Sportsbook outcome attempts": attempts,
+            "Polymarket teams loaded": len(poly_teams),
             "Metadata matches": len(meta_matches),
             "CLOB priced matches": len(rows),
         })
@@ -785,6 +980,10 @@ def board():
                     "books": ", ".join(b.get("key","") for b in e.get("bookmakers", [])),
                 } for e in book_events[:20]]
                 st.dataframe(pd.DataFrame(sample), use_container_width=True, hide_index=True)
+        debug_candidates = candidate_debug(poly_markets, book_events, selected_markets, poly_teams, limit=15)
+        if debug_candidates:
+            with st.expander("Best rejected/accepted match candidates", expanded=(len(meta_matches) == 0)):
+                st.dataframe(pd.DataFrame(debug_candidates), use_container_width=True, hide_index=True)
         if meta_matches:
             with st.expander("Sample metadata matches"):
                 st.dataframe(pd.DataFrame(meta_matches[:30])[
