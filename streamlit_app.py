@@ -75,7 +75,7 @@ def to_int(v, default):
         return default
 
 
-ODDS_API_KEY = str(secret("ODDS_API_KEY", "")).strip()
+SECRET_ODDS_API_KEY = str(secret("ODDS_API_KEY", "")).strip()
 POLL_SECONDS = max(30, to_int(secret("SPORTSBOOK_POLL_SECONDS", 60), 60))
 DISCOVERY_SECONDS = max(120, to_int(secret("POLY_DISCOVERY_SECONDS", 300), 300))
 DEFAULT_BANKROLL = to_float(secret("BANKROLL", 1000), 1000)
@@ -576,8 +576,6 @@ def get_engine(api_key: str):
     return eng
 
 
-engine = get_engine(ODDS_API_KEY)
-
 
 # ------------------------------
 # UI helpers
@@ -634,6 +632,31 @@ def signal_for(row, bankroll, kelly_fraction, max_poly_spread, max_book_age, max
 
 # Sidebar controls
 st.sidebar.markdown("## ⚙️ Edge Settings")
+
+# Streamlit Secrets is preferred, but a session-only password field makes the
+# app usable immediately if the secret has not been configured yet.  The value
+# typed here is kept only in the current Streamlit session and is never written
+# to GitHub or displayed back in plain text.
+if SECRET_ODDS_API_KEY:
+    active_api_key = SECRET_ODDS_API_KEY
+    st.sidebar.success("Sportsbook API key loaded from Streamlit Secrets.")
+else:
+    active_api_key = st.sidebar.text_input(
+        "The Odds API key",
+        type="password",
+        placeholder="Paste key for this session",
+        help="For a permanent setup, save ODDS_API_KEY in Streamlit → Manage app → Settings → Secrets.",
+        key="runtime_odds_api_key",
+    ).strip()
+    if active_api_key:
+        st.sidebar.info("Using a session-only API key. Save it in Streamlit Secrets if you want it to survive restarts.")
+    else:
+        st.sidebar.warning("Sportsbook feed is off until an Odds API key is provided.")
+
+# The cache key includes the API key. Entering a key therefore starts a fresh
+# data engine with sportsbook polling without requiring a redeploy.
+engine = get_engine(active_api_key)
+
 bankroll = st.sidebar.number_input("Bankroll ($)", min_value=1.0, value=float(DEFAULT_BANKROLL), step=50.0)
 kelly_choice = st.sidebar.selectbox("Kelly sizing", ["1/8 Kelly", "1/4 Kelly", "1/2 Kelly", "Full Kelly"], index=1)
 kelly_fraction = {"1/8 Kelly": 0.125, "1/4 Kelly": 0.25, "1/2 Kelly": 0.5, "Full Kelly": 1.0}[kelly_choice]
@@ -646,8 +669,8 @@ max_poly_age = st.sidebar.slider("Max Poly quote age (sec)", 10, 120, 30, 5)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Sportsbook polling: every {POLL_SECONDS}s (provider freshness may be slower).")
-if not ODDS_API_KEY:
-    st.sidebar.error("Missing ODDS_API_KEY. Add it in Streamlit → App settings → Secrets.")
+if not active_api_key:
+    st.sidebar.error("DraftKings/FanDuel are disabled until a sportsbook API key is entered above or saved as ODDS_API_KEY in Streamlit Secrets.")
 
 
 # Header
@@ -727,7 +750,14 @@ def live_board():
 
     with tab1:
         if not filtered:
-            st.info("No matched markets currently pass your selected filters. The board will update automatically.")
+            if not active_api_key:
+                st.info("Polymarket is live, but DraftKings/FanDuel are off. Enter your Odds API key in the sidebar or save ODDS_API_KEY in Streamlit Secrets.")
+            elif snap["connections"].get("sportsbook") == "error":
+                st.error("The sportsbook feed returned an error. Open the Diagnostics tab for the latest API message.")
+            elif snap["sportsbook_event_count"] == 0:
+                st.info("The sportsbook API is connected but has not returned events yet. The board will refresh automatically.")
+            else:
+                st.info("Sportsbook events are loaded, but no Polymarket/book markets are matched under the current filters yet. The board will update automatically.")
         else:
             display = []
             for r in filtered[:300]:

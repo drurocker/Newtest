@@ -48,3 +48,8 @@ POLY_DISCOVERY_SECONDS = 300
 
 ## Important limitation
 Streamlit Community Cloud can put an inactive app to sleep. That means this V1 is excellent as a dashboard while you have it open, but it is not yet a guaranteed 24/7 historical data collector. For continuous lead/lag logging, we can later move the collector/database to a persistent backend while keeping Streamlit as the front end.
+
+
+## V1.1 sportsbook-key fix
+
+If Streamlit Secrets has not been configured, the sidebar now includes a password field for **The Odds API key**. Paste the key there and the DraftKings/FanDuel polling engine starts immediately for that browser session. For a permanent setup, store `ODDS_API_KEY` in Streamlit Community Cloud → Manage app → Settings → Secrets.
